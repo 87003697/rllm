@@ -23,12 +23,14 @@ set -euo pipefail
 ENV_NAME="math"
 FAST_MODE=0
 UPLOAD_CACHE=0
+SYSTEM_MONITOR=1
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --env)          ENV_NAME="$2"; shift 2 ;;
         --fast)         FAST_MODE=1; shift ;;
         --upload-cache) UPLOAD_CACHE=1; shift ;;
+        --no-monitor)   SYSTEM_MONITOR=0; shift ;;
         *)              echo "ERROR: Unknown option: $1"; return 1 2>/dev/null || exit 1 ;;
     esac
 done
@@ -54,7 +56,7 @@ OUTPUT_LOCAL="/local-ssd/rllm-output"
 
 # S3 cache paths
 VENV_TAR_S3="${S3_PREFIX}/tools/rllm-venv.tar"
-HF_MODEL="${HF_MODEL:-Qwen/Qwen3-4B-Instruct-2507}"
+HF_MODEL="${HF_MODEL:-Qwen/Qwen3.5-9B}"
 HF_MODEL_SHORT=$(echo "${HF_MODEL}" | awk -F'/' '{print $NF}' | tr '[:upper:]' '[:lower:]')
 HF_TAR_S3="${S3_PREFIX}/tools/hf_cache_${HF_MODEL_SHORT}.tar"
 DATASETS_TAR_S3="${S3_PREFIX}/tools/rllm-datasets-${ENV_NAME}.tar"
@@ -143,7 +145,7 @@ _default_env_setup() {
 
     if [[ -n "${EXTRA_DEPS:-}" ]]; then
         echo "  Installing extra deps: ${EXTRA_DEPS}"
-        uv pip install ${PIP_PYTHON} ${EXTRA_DEPS}
+        uv pip install --upgrade ${PIP_PYTHON} "${EXTRA_DEPS}"
     fi
 
     if [[ -n "${EXTRA_APT:-}" ]]; then
@@ -202,6 +204,35 @@ setup_s3_sync() {
     trap "kill ${SYNC_PID} 2>/dev/null || true; aws s3 sync ${OUTPUT_LOCAL}/ ${OUTPUT_S3}/ --quiet 2>/dev/null || true" EXIT
 }
 
+setup_system_monitor() {
+    if [[ ${SYSTEM_MONITOR} -eq 0 ]]; then return; fi
+    local interval="${MONITOR_INTERVAL:-60}"
+    local logfile="${OUTPUT_LOCAL}/logs/system_monitor.log"
+    mkdir -p "$(dirname "${logfile}")"
+    echo "=== System Monitor (every ${interval}s) ==="
+    (while true; do
+        block="=== MONITOR $(date +%H:%M:%S) ==="
+        if command -v nvidia-smi &>/dev/null; then
+            block+=$'\n'"$(nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw \
+                --format=csv,noheader,nounits | \
+                awk -F', ' '{printf "  [GPU %s] mem=%s/%sMiB util=%s%% temp=%s°C power=%sW\n", $1, $2, $3, $4, $5, $6}')"
+        fi
+        cpu1=$(awk '/^cpu /{print $2, $4, $5}' /proc/stat 2>/dev/null)
+        sleep 1
+        cpu2=$(awk '/^cpu /{print $2, $4, $5}' /proc/stat 2>/dev/null)
+        cpu_usage=$(echo "$cpu1" "$cpu2" | awk '{u=$4+$5-$1-$2; t=u+$6-$3; if(t>0) printf "%.0f", u*100/t; else printf "?"}')
+        mem_info=$(awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END{printf "%.0f/%.0fGiB", (t-a)/1048576, t/1048576}' /proc/meminfo 2>/dev/null || echo "?")
+        block+=$'\n'"  [SYS] cpu=${cpu_usage}% mem=${mem_info}"
+        if df /local-ssd &>/dev/null; then
+            block+=$'\n'"  [DISK] /local-ssd $(df -h /local-ssd | awk 'NR==2{printf "%s/%s (%s)", $3, $2, $5}')"
+        fi
+        echo "$block"
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $block" >> "${logfile}"
+        sleep "$interval"
+    done) &
+    echo "  PID=$! interval=${interval}s logfile=${logfile}"
+}
+
 _default_verify() {
     echo "=== Verify ==="
     local PY="${VENV_PATH}/bin/python"
@@ -224,6 +255,7 @@ restore_venv
 run_env_setup
 restore_hf_cache
 setup_s3_sync
+setup_system_monitor
 
 export PATH="${VENV_PATH}/bin:${PATH}"
 

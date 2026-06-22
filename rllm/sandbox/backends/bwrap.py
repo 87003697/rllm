@@ -29,8 +29,10 @@ class BwrapSandbox:
     provides /tmp. Network is blocked via --unshare-net.
     """
 
-    def __init__(self, name: str, network: bool = False, **kwargs):
+    def __init__(self, name: str, network: bool | None = None, **kwargs):
         self.name = name
+        if network is None:
+            network = os.environ.get("RLLM_BWRAP_NETWORK", "0") == "1"
         self._network = network
         self._workdir = tempfile.mkdtemp(prefix=f"rllm-bwrap-{name}-")
         self._app_dir = os.path.join(self._workdir, "app")

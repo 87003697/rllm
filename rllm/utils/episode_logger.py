@@ -5,7 +5,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+from rllm.eval.episode_store import _json_default, _sanitize
 from rllm.types import Episode
+
+# Training payload fields to exclude (save disk, visualizer doesn't need them)
+_STEP_EXCLUDE = {"prompt_ids", "response_ids", "logprobs", "routing_matrices", "mc_return", "advantage", "weight_version", "model_output"}
 
 
 class EpisodeLogger:
@@ -18,11 +22,10 @@ class EpisodeLogger:
             base_dir: Base directory for episode logs. Can be configured via
                      config.trainer.episode_log_dir
                      (default: "logs/${trainer.project_name}/${trainer.experiment_name}")
-            subdirectory: Subdirectory within base_dir for episodes (default: "episodes")
-                         Final path will be: {base_dir}/{subdirectory}/
+            subdirectory: Kept for backward compatibility, ignored.
         """
-        self.log_dir = Path(base_dir) / subdirectory
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.base_dir = Path(base_dir)
+        self.base_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def compute_task_hash(task: Any, length: int = 8) -> str:
@@ -35,15 +38,15 @@ class EpisodeLogger:
         Returns:
             Hash string
         """
-        # Convert task to a stable string representation
         task_str = json.dumps(task, sort_keys=True, default=str)
-        # Compute SHA256 hash
         hash_obj = hashlib.sha256(task_str.encode("utf-8"))
-        # Return first `length` characters of hex digest
         return hash_obj.hexdigest()[:length]
 
     def get_step_dir(self, step: int, mode: str = "train", epoch: int = 0) -> Path:
-        """Get the directory path for a specific training or validation step.
+        """Get the run directory for a specific training step.
+
+        Each step becomes a "run" directory with an episodes/ subdirectory,
+        matching the layout that rllm view expects.
 
         Args:
             step: Current training/validation step
@@ -51,11 +54,12 @@ class EpisodeLogger:
             epoch: Current epoch number, defaults to 0
 
         Returns:
-            Path object for the step directory
+            Path object for the run directory
         """
-        step_dir = self.log_dir / f"{mode}_step_{step}_epoch_{epoch}"
-        step_dir.mkdir(parents=True, exist_ok=True)
-        return step_dir
+        run_dir = self.base_dir / f"{mode}_step_{step}_epoch_{epoch}"
+        episodes_dir = run_dir / "episodes"
+        episodes_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir
 
     def get_episode_filename(self, episode: Episode, step: int) -> str:
         """Generate filename for an episode.
@@ -70,9 +74,7 @@ class EpisodeLogger:
             Filename string
         """
         task_hash = self.compute_task_hash(episode.task)
-        # Clean episode_id to make it filesystem-safe
         episode_id_safe = str(episode.id).replace(":", "_").replace("/", "_")
-
         filename = f"episode_hash{task_hash}_id{episode_id_safe}.json"
         return filename
 
@@ -85,54 +87,31 @@ class EpisodeLogger:
             mode: Mode identifier ('train' or 'val'), defaults to 'train'
             epoch: Current epoch number, defaults to 0
         """
-        episode_data = {
-            "training_step": step,
-            "epoch": epoch,
-            "episode_id": episode.id,
-            "session_id": episode.session_id,
-            "task": episode.task,
-            "task_hash": self.compute_task_hash(episode.task),
-            "is_correct": episode.is_correct,
-            "termination_reason": (episode.termination_reason.value if episode.termination_reason else None),
-            "metrics": episode.metrics,
-            "metadata": episode.metadata,
-            "timing": episode.info.get("timing", {}),
-            "trajectories": [],
-        }
+        # Exclude training payload arrays (prompt_ids, logprobs, etc.) from every step
+        data = episode.model_dump(
+            mode="json",
+            exclude={
+                "trajectories": {
+                    "__all__": {          # every trajectory
+                        "steps": {
+                            "__all__": _STEP_EXCLUDE,  # every step
+                        },
+                    },
+                },
+            },
+        )
+        data["training_step"] = step
+        data["training_epoch"] = epoch
 
-        for traj in episode.trajectories:
-            traj_data = {
-                "name": traj.name,
-                "uid": traj.uid,
-                "reward": traj.reward,
-                "num_steps": len(traj.steps),
-                "timing": traj.info.get("timing", {}),
-                "steps": [
-                    {
-                        "observation": step.observation,
-                        "thought": step.thought,
-                        "action": step.action,
-                        "reward": step.reward,
-                        "done": step.done,
-                        "model_response": step.model_response,
-                        "chat_completions": step.chat_completions,
-                        "timing": step.info.get("timing", {}),  # Add step-level timing
-                    }
-                    for step in traj.steps
-                ],
-            }
-            episode_data["trajectories"].append(traj_data)
-
-        # Write to individual file in step-specific directory
-        step_dir = self.get_step_dir(step, mode, epoch)
+        run_dir = self.get_step_dir(step, mode, epoch)
         filename = self.get_episode_filename(episode, step)
-        filepath = step_dir / filename
+        filepath = run_dir / "episodes" / filename
 
         try:
             with open(filepath, "w") as f:
-                json_str = json.dumps(episode_data, indent=2, default=str)
+                json_str = json.dumps(data, indent=2, default=_json_default)
                 f.write(json_str + "\n")
-                f.flush()  # Ensure data is written to disk
+                f.flush()
         except Exception as e:
             print(f"Error writing episode to {filepath}: {e}")
             import traceback
@@ -159,35 +138,25 @@ class EpisodeLogger:
                 raise
 
     def log_episodes_batch(self, episodes: list[Episode], step: int, mode: str = "train", epoch: int = 0, batch_summary: bool = True):
-        """Log multiple episodes and optionally create a batch summary in step-specific directory.
+        """Log multiple episodes and optionally create a meta.json in step-specific directory.
 
         Args:
             episodes: List of episodes to log
             step: Current training/validation step
             mode: Mode identifier ('train' or 'val'), defaults to 'train'
             epoch: Current epoch number, defaults to 0
-            batch_summary: Whether to create a summary file for the batch
+            batch_summary: Whether to create a meta.json file for the batch
         """
-        # Log individual episodes
         self.log_episodes(episodes, step, mode, epoch)
 
-        # Optionally create batch summary in step-specific directory
         if batch_summary and episodes:
-            summary_data = {
+            run_dir = self.get_step_dir(step, mode, epoch)
+            meta = {
                 "training_step": step,
                 "epoch": epoch,
                 "mode": mode,
-                "num_episodes": len(episodes),
-                "episode_files": [self.get_episode_filename(ep, step) for ep in episodes],
-                "summary_stats": {
-                    "total_correct": sum(1 for ep in episodes if ep.is_correct),
-                    "total_incorrect": sum(1 for ep in episodes if not ep.is_correct),
-                    "accuracy": sum(1 for ep in episodes if ep.is_correct) / len(episodes) if episodes else 0,
-                    "avg_trajectories_per_episode": sum(len(ep.trajectories) for ep in episodes) / len(episodes) if episodes else 0,
-                },
+                "n_episodes": len(episodes),
+                "accuracy": sum(1 for ep in episodes if ep.is_correct) / len(episodes),
             }
-
-            step_dir = self.get_step_dir(step, mode, epoch)
-            summary_file = step_dir / "batch_summary.json"
-            with open(summary_file, "w") as f:
-                json.dump(summary_data, f, indent=2)
+            with open(run_dir / "meta.json", "w") as f:
+                json.dump(meta, f, indent=2)

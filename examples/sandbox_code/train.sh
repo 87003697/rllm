@@ -64,8 +64,8 @@ python3 -m examples.sandbox_code.train \
     trainer.nnodes=1 \
     trainer.save_freq=1000 \
     trainer.test_freq=5 \
-    trainer.log_episodes=True \
-    trainer.episode_log_dir=/local-ssd/rllm-output/episode_logs \
+    +trainer.log_episodes=True \
+    +trainer.episode_log_dir=/local-ssd/rllm-output/episode_logs \
     trainer.default_hdfs_dir=null \
     trainer.total_epochs=50
 
